@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: ci/bash.sh <CONTAINER_NAME> -e key value -v key value [COMMAND]"
+    echo "Usage: ci/bash.sh <CONTAINER_NAME> -e key [value] -v key value [COMMAND]"
     exit -1
 fi
 
@@ -17,10 +17,19 @@ shift 1
 while [[ $# -gt 0 ]]; do
     cmd="$1"
     if [[ $cmd == "-e" ]]; then
+        if [[ $# -lt 2 ]]; then
+            echo "ERROR: -e requires an environment variable name"
+            exit -1
+        fi
         env_key=$2
-        env_value=$3
-        shift 3
-        DOCKER_ENV="${DOCKER_ENV} -e ${env_key}=${env_value}"
+        if [[ $# -ge 3 && $3 != -* ]]; then
+            env_value=$3
+            shift 3
+            DOCKER_ENV="${DOCKER_ENV} -e ${env_key}=${env_value}"
+        else
+            shift 2
+            DOCKER_ENV="${DOCKER_ENV} -e ${env_key}"
+        fi
     elif [[ $cmd == "-v" ]]; then
         volumn_key=$2
         volumn_value=$3
@@ -69,6 +78,10 @@ echo "IMAGE NAME: ${DOCKER_IMAGE_NAME}"
 echo "ENV VARIABLES: ${DOCKER_ENV}"
 echo "VOLUMES: ${DOCKER_VOLUMNS}"
 echo "COMMANDS: '${COMMAND[@]}'"
+
+# Pull the latest docker image
+echo "Pulling latest image: ${DOCKER_IMAGE_NAME}"
+${DOCKER_BINARY} pull ${DOCKER_IMAGE_NAME}
 
 # By default we cleanup - remove the container once it finish running (--rm)
 # and share the PID namespace (--pid=host) so the process inside does not have

@@ -14,91 +14,68 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from functools import cache
+import functools
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
-from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops  # noqa: F401
-from .utils import register_custom_op, register_fake_op
-
-silu_def_cu_str = r"""
-__device__ __forceinline__ float silu(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
-"""
-
-gelu_def_cu_str = r"""
-__device__ __forceinline__ float gelu(const float& val) {
-  constexpr float kAlpha = M_SQRT1_2;
-  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
-}
-"""
-
-gelu_def_tanh_cu_str = r"""
-__device__ __forceinline__ float gelu_tanh(const float& val) {
-  const float cdf =
-      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
-  return val * cdf;
-}
-"""
-
-act_func_def_str = {
-    "silu": silu_def_cu_str,
-    "gelu": gelu_def_cu_str,
-    "gelu_tanh": gelu_def_tanh_cu_str,
-}
+from .api_logging import flashinfer_api
+from .jit import gen_act_and_mul_module
+from .trace.templates.activation import (
+    gelu_and_mul_trace,
+    gelu_tanh_and_mul_trace,
+    silu_and_mul_scaled_nvfp4_experts_quantize_trace,
+    silu_and_mul_trace,
+)
+from .utils import (
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+    get_compute_capability,
+)
+from .quantization.fp4_quantization import get_fp4_quantization_module
 
 
-_jit_modules = {}
-
-
+@functools.cache
 def get_act_and_mul_module(act_func_name: str):
-    global _jit_modules
-    if act_func_name not in _jit_modules:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
+    module = gen_act_and_mul_module(act_func_name).build_and_load()
 
-            module = _kernels
-        else:
-            module = gen_act_and_mul_module(
-                act_func_name, act_func_def_str[act_func_name]
-            )
+    # torch library for act_and_mul
+    fname = f"{act_func_name}_and_mul"
+    fn = getattr(module, fname)
 
-        # torch library for act_and_mul
-        fname = f"{act_func_name}_and_mul"
-        fn = getattr(module, fname).default
+    @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
+    def _act_and_mul(
+        out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
+    ) -> None:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        fn(out, input, enable_pdl)
 
-        @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
-        def _act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
-        ) -> None:
-            fn(out, input, enable_pdl)
+    @register_fake_op(f"flashinfer::{fname}")
+    def _fake_act_and_mul(
+        out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
+    ) -> None:
+        pass
 
-        @register_fake_op(f"flashinfer::{fname}")
-        def _fake_act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
-        ) -> None:
-            pass
-
-        # Register the module
-        _jit_modules[act_func_name] = SimpleNamespace(**{fname: _act_and_mul})
-
-    return _jit_modules[act_func_name]
+    # Register the module
+    return SimpleNamespace(**{fname: _act_and_mul})
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
-    assert (
-        input.shape[:-1] == output.shape[:-1]
-    ), f"{input.shape[:-1]} != {output.shape[:-1]}"
-    assert (
-        input.shape[-1] == 2 * output.shape[-1]
-    ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
+    assert input.shape[:-1] == output.shape[:-1], (
+        f"{input.shape[:-1]} != {output.shape[:-1]}"
+    )
+    assert input.shape[-1] == 2 * output.shape[-1], (
+        f"{input.shape[-1]} != {2 * output.shape[-1]}"
+    )
 
 
+@flashinfer_api(trace=silu_and_mul_trace)
 def silu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused SiLU and Mul operation.
 
@@ -121,6 +98,8 @@ def silu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -139,8 +118,9 @@ def silu_and_mul(
     return out
 
 
+@flashinfer_api(trace=gelu_tanh_and_mul_trace)
 def gelu_tanh_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused GeLU Tanh and Mul operation.
 
@@ -163,6 +143,8 @@ def gelu_tanh_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -177,8 +159,9 @@ def gelu_tanh_and_mul(
     return out
 
 
+@flashinfer_api(trace=gelu_and_mul_trace)
 def gelu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused GeLU and Mul operation.
 
@@ -201,6 +184,8 @@ def gelu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -213,3 +198,51 @@ def gelu_and_mul(
         )
     get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out
+
+
+@flashinfer_api(trace=silu_and_mul_scaled_nvfp4_experts_quantize_trace)
+def silu_and_mul_scaled_nvfp4_experts_quantize(
+    a,
+    mask,
+    a_global_sf,
+):
+    r"""Fused SiLU + mul + per-expert NVFP4 quantization with a per-row mask.
+
+    Used by mixture-of-experts pipelines to fuse the SiLU-gated activation
+    of each expert with NVFP4 quantization, applying ``mask`` to skip rows
+    that do not belong to the current expert.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
+    mask : torch.Tensor
+        Mask tensor applied before quantization (typically the
+        expert-assignment mask).
+    a_global_sf : torch.Tensor
+        Global scale factor of shape ``[1]`` with dtype ``float32``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, K/2, B]``
+        with dtype ``FLOAT4_E2M1X2`` (the implementation permutes the
+        ``[B, M, K/2]`` physical layout so that the batch dim is last,
+        matching the grouped-GEMM expectation) and ``sf`` is the 6D
+        swizzled scale-factor tensor of logical shape
+        ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
+        ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
+        of 128 and ``padded_K`` rounds ``K // sf_vec_size`` up to a
+        multiple of 4.  Here ``sf_vec_size`` is fixed at ``16`` (NVFP4),
+        matching :func:`flashinfer.quantization.nvfp4_quantize`.
+    """
+    major, minor = get_compute_capability(a.device)
+    device_arch = f"{major * 10 + minor}"
+    a_fp4, a_sf = get_fp4_quantization_module(
+        device_arch
+    ).silu_and_mul_scaled_nvfp4_experts_quantize_sm100(
+        a,
+        mask,
+        a_global_sf,
+    )
+    return a_fp4, a_sf

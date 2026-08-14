@@ -4,7 +4,6 @@
 #include <flashinfer/math.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/cutlass_utils.cuh>
-#include "pytorch_extension_utils.h"
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
@@ -43,6 +42,7 @@ struct RaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
@@ -88,6 +88,7 @@ struct PagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
@@ -102,6 +103,11 @@ struct PagedParams {
   int64_t v_stride_h;
   int64_t o_stride_h;
   int64_t nnz_qo;
+
+  // NOTE: For sparse paged KV cache, we need the stride between pages
+  // This is paged_k_cache.stride(0), not the layout stride
+  int64_t k_page_stride;  // Stride between pages for K
+  int64_t v_page_stride;  // Stride between pages for V
 
   int head_dim;
   int num_qo_heads;

@@ -153,7 +153,7 @@ struct CollectiveEpilogue {
   CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
                             TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
-    auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+    auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
@@ -168,7 +168,7 @@ struct CollectiveEpilogue {
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
     cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
@@ -195,10 +195,9 @@ struct CollectiveEpilogue {
     }
 
     int write_warp_idx = NUM_WARPS - 1;
-    if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-    }
+    // Make sure all MMA WGs finish STSM O
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
+                                      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     TiledCopyO gmem_tiled_copy_O;
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
@@ -213,7 +212,7 @@ struct CollectiveEpilogue {
   template <typename BlockCoord, typename SharedStorage>
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, SharedStorage& shared_storage,
                                  int thread_idx, BlockCoord const& block_coord) {
-    auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+    auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
     Tensor gO = get_local_tile_tensor(mO, select<0, 1>(TileShape_PDV{}), qo_head_idx, qo_indptr,

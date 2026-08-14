@@ -13,81 +13,42 @@ Prerequisites
 
 - OS: Linux only
 
-- Python: 3.8, 3.9, 3.10, 3.11, 3.12
+- Python: 3.10, 3.11, 3.12, 3.13, 3.14
 
-- PyTorch: 2.2/2.3/2.4/2.5 with CUDA 11.8/12.1/12.4 (only for torch 2.4 or later)
+- CUDA: 12.6, 12.8, 13.0, 13.1
 
-  - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
-
-- Supported GPU architectures: ``sm75``, ``sm80``, ``sm86``, ``sm89``, ``sm90``.
+.. note::
+   FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
 
 Quick Start
 ^^^^^^^^^^^
 
-The easiest way to install FlashInfer is via pip, we host wheels with indexed URL for different PyTorch versions and CUDA versions. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
+The easiest way to install FlashInfer is via pip. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
 
-.. tabs::
+.. code-block:: bash
 
-    .. tab:: PyTorch 2.5
+    pip install flashinfer-python
 
-        .. tabs::
+Package Options
+"""""""""""""""
 
-            .. tab:: CUDA 12.4
+FlashInfer provides three packages:
 
-                .. code-block:: bash
+- **flashinfer-python**: Core package that compiles/downloads kernels on first use
+- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
 
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
+**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 
-            .. tab:: CUDA 12.1
+.. code-block:: bash
 
-                .. code-block:: bash
+    pip install flashinfer-python
+    # cubin package
+    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+    # JIT cache package (replace cu129 with your CUDA version: cu129 or cu130)
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
 
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.5/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.5/
-
-    .. tab:: PyTorch 2.4
-
-        .. tabs::
-
-            .. tab:: CUDA 12.4
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.4/
-
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.4/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.4/
-
-    .. tab:: PyTorch 2.3
-
-        .. tabs::
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.3/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.3/
+This eliminates compilation and downloading overhead at runtime.
 
 
 .. _install-from-source:
@@ -97,18 +58,6 @@ Install from Source
 
 In certain cases, you may want to install FlashInfer from source code to try out the latest features in the main branch, or to customize the library for your specific needs.
 
-FlashInfer offers two installation modes:
-
-JIT mode
-   - CUDA kernels are compiled at runtime using PyTorch's JIT, with compiled kernels cached for future use.
-   - JIT mode allows fast installation, as no CUDA kernels are pre-compiled, making it ideal for development and testing.
-   - JIT version is also available as a sdist in `PyPI <https://pypi.org/project/flashinfer-python/>`_.
-
-AOT mode
-   - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.
-   - If a required kernel is not pre-compiled, it will be compiled at runtime using JIT. AOT mode is recommended for production environments.
-
-JIT mode is the default installation mode. To enable AOT mode, set the environment variable ``FLASHINFER_ENABLE_AOT=1`` before installing FlashInfer.
 You can follow the steps below to install FlashInfer from source code:
 
 1. Clone the FlashInfer repository:
@@ -123,109 +72,82 @@ You can follow the steps below to install FlashInfer from source code:
 
        python -c "import torch; print(torch.__version__, torch.version.cuda)"
 
-3. Install Ninja build system:
+3. Install FlashInfer:
 
    .. code-block:: bash
 
-       pip install ninja
+       cd flashinfer
+       python -m pip install -v .
 
-4. Install FlashInfer:
-
-   .. tabs::
-
-       .. tab:: JIT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               pip install --no-build-isolation --verbose --editable .
-
-       .. tab:: AOT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 pip install --no-build-isolation --verbose --editable .
-
-5. Create FlashInfer distributions (optional):
-
-   .. tabs::
-
-       .. tab:: Create sdist
-
-           .. code-block:: bash
-
-               cd flashinfer
-               python -m build --no-isolation --sdist
-               ls -la dist/
-
-       .. tab:: Create wheel for JIT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               python -m build --no-isolation --wheel
-               ls -la dist/
-
-       .. tab:: Create wheel for AOT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 python -m build --no-isolation --wheel
-               ls -la dist/
-
-C++ API
--------
-
-FlashInfer is a header-only library with only CUDA/C++ standard library dependency
-that can be directly integrated into your C++ project without installation.
-
-You can check our `unittest and benchmarks <https://github.com/flashinfer-ai/flashinfer/tree/main/src>`_ on how to use our C++ APIs at the moment.
-
-.. note::
-    The ``nvbench`` and ``googletest`` dependency in ``3rdparty`` directory are only
-    used to compile unittests and benchmarks, and are not required for the library itself.
-
-.. _compile-cpp-benchmarks-tests:
-
-Compile Benchmarks and Unittests
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-To compile the C++ benchmarks (using `nvbench <https://github.com/NVIDIA/nvbench>`_) and unittests, you can follow the steps below:
-
-1. Clone the FlashInfer repository:
+   **For development**, install in editable mode:
 
    .. code-block:: bash
 
-       git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+       python -m pip install --no-build-isolation -e . -v
 
-2. Check conda is installed (you can skip this step if you have installed cmake and ninja in other ways):
+   .. note::
+      When using ``--no-build-isolation``, pip does not automatically install build
+      dependencies. FlashInfer requires ``setuptools>=77``. If you encounter an error
+      like ``AttributeError: module 'setuptools.build_meta' has no attribute
+      'prepare_metadata_for_build_editable'``, upgrade pip and setuptools first:
 
-   .. code-block:: bash
+      .. code-block:: bash
 
-       conda --version
+          python -m pip install --upgrade pip setuptools
 
-   If conda is not installed, you can install it by following the instructions on the `miniconda <https://docs.conda.io/en/latest/miniconda.html>`_ or
-   `miniforge <https://github.com/conda-forge/miniforge>`_ websites.
+4. (Optional) Build optional packages:
 
-2. Install CMake and Ninja build system:
-
-   .. code-block:: bash
-
-       conda install cmake ninja
-
-3. Create build directory and copy configuration files
+   Build ``flashinfer-cubin``:
 
    .. code-block:: bash
 
-       mkdir -p build
-       cp cmake/config.cmake build/  # you can modify the configuration file if needed
+       cd flashinfer-cubin
+       python -m build --no-isolation --wheel
+       python -m pip install dist/*.whl
 
-4. Compile the benchmarks and unittests:
+   Build ``flashinfer-jit-cache`` (customize ``FLASHINFER_CUDA_ARCH_LIST`` for your target GPUs):
 
    .. code-block:: bash
 
-       cd build
-       cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
-       ninja
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f"
+
+   For DGX Spark / GB10, add the arch-specific SM121 target so JIT-cache
+   wheels include native ``121a`` artifacts for NVFP4/MXFP4 MMA:
+
+   .. code-block:: bash
+
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f 12.1a"
+       cd flashinfer-jit-cache
+       python -m build --no-isolation --wheel
+       python -m pip install dist/*.whl
+
+
+Install Nightly Build
+^^^^^^^^^^^^^^^^^^^^^^
+
+Nightly builds are available for testing the latest features:
+
+.. code-block:: bash
+
+    # Core and cubin packages
+    pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
+    pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
+    pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
+    # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+    pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+
+Verify Installation
+^^^^^^^^^^^^^^^^^^^
+
+After installation, verify that FlashInfer is correctly installed and configured:
+
+.. code-block:: bash
+
+    flashinfer show-config
+
+This command displays:
+
+- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status

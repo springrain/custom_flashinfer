@@ -44,6 +44,16 @@ constexpr __host__ __device__ __forceinline__ uint32_t upcast_size() {
   return sizeof(b128_t) / sizeof(T);
 }
 
+template <SwizzleMode swizzle_mode, uint32_t stride>
+__device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
+  if constexpr (swizzle_mode == SwizzleMode::k128B) {
+    return i * stride + (j ^ (i % 8));
+  } else {
+    // swizzle_mode == SwizzleMode::k64B
+    return i * stride + (j ^ ((i / 2) % 4));
+  }
+}
+
 /*!
  * \brief The shared memory wrapper.
  */
@@ -161,6 +171,13 @@ struct smem_t {
     b128_t* smem_ptr = base + offset;
     cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(smem_ptr,
                                                            reinterpret_cast<const b128_t*>(gptr));
+  }
+
+  template <cp_async::SharedMemFillMode fill_mode, typename T>
+  __device__ __forceinline__ void load_64b_async(uint32_t offset, const T* gptr, bool predicate) {
+    b128_t* smem_ptr = base + offset;
+    cp_async::pred_load_128b_from_64b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
+        smem_ptr, reinterpret_cast<const b128_t*>(gptr), predicate);
   }
 
   template <typename T>

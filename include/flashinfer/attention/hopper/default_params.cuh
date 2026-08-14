@@ -82,10 +82,15 @@ struct BatchPrefillRaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;
@@ -128,10 +133,15 @@ struct BatchPrefillPagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;
@@ -143,6 +153,11 @@ struct BatchPrefillPagedParams {
   int64_t v_stride_h;
   int64_t o_stride_h;
   int64_t nnz_qo;
+
+  // NOTE: For sparse paged KV cache, we need the stride between pages
+  // This is paged_k_cache.stride(0), not the layout stride
+  int64_t k_page_stride;  // Stride between pages for K
+  int64_t v_page_stride;  // Stride between pages for V
 
   int num_qo_heads;
   int num_kv_heads;

@@ -155,6 +155,12 @@ struct BatchPrefillRaggedParams {
   uint32_t k_stride_h;
   uint32_t v_stride_n;
   uint32_t v_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -172,6 +178,10 @@ struct BatchPrefillRaggedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* maybe_prefix_len_ptr;
+  uint16_t* maybe_token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
@@ -195,6 +205,12 @@ struct BatchPrefillRaggedParams {
         k_stride_h(0),
         v_stride_n(0),
         v_stride_h(0),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -210,7 +226,11 @@ struct BatchPrefillRaggedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
@@ -242,6 +262,12 @@ struct BatchPrefillRaggedParams {
         k_stride_h(kv_stride_h),
         v_stride_n(kv_stride_n),
         v_stride_h(kv_stride_h),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
@@ -257,7 +283,11 @@ struct BatchPrefillRaggedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -288,6 +318,12 @@ struct BatchPrefillPagedParams {
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
+  uint32_t k_sf_stride_page;
+  uint32_t k_sf_stride_n;
+  uint32_t k_sf_stride_h;
+  uint32_t v_sf_stride_page;
+  uint32_t v_sf_stride_n;
+  uint32_t v_sf_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -305,6 +341,10 @@ struct BatchPrefillPagedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* maybe_prefix_len_ptr;
+  uint16_t* maybe_token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
@@ -320,6 +360,12 @@ struct BatchPrefillPagedParams {
         num_qo_heads(0),
         q_stride_n(0),
         q_stride_h(0),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -335,7 +381,11 @@ struct BatchPrefillPagedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
@@ -357,6 +407,12 @@ struct BatchPrefillPagedParams {
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
+        k_sf_stride_page(0),
+        k_sf_stride_n(0),
+        k_sf_stride_h(0),
+        v_sf_stride_page(0),
+        v_sf_stride_n(0),
+        v_sf_stride_h(0),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
@@ -372,7 +428,11 @@ struct BatchPrefillPagedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
