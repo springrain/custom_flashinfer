@@ -149,6 +149,25 @@ def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     return wrapper
 
 
+def test_legacy_positional_bsz_tensor_before_backend():
+    import flashinfer.mla as mla
+
+    bsz_tensor = torch.tensor([2], dtype=torch.int32)
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(16, dtype=torch.uint8),
+        False,
+        None,
+        None,
+        None,
+        None,
+        bsz_tensor,
+        "fa2",
+    )
+
+    assert wrapper._bsz_tensor is bsz_tensor
+    assert wrapper._backend == "fa2"
+
+
 def _patch_fake_fa_module(monkeypatch, fake_module):
     import flashinfer.mla._batch_mla._backends.fa2_backend as fa2_backend
     import flashinfer.mla._batch_mla._backends.fa3_backend as fa3_backend

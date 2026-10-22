@@ -347,8 +347,11 @@ class BatchMLAPagedAttentionWrapper:
         """
         # The pre-TVM KT wrapper placed bsz_tensor before backend. Accept that
         # positional form while keeping the upstream backend argument intact.
-        if isinstance(backend, torch.Tensor) and bsz_tensor is None:
-            bsz_tensor, backend = backend, "auto"
+        if isinstance(backend, torch.Tensor):
+            if bsz_tensor is None:
+                bsz_tensor, backend = backend, "auto"
+            elif isinstance(bsz_tensor, str):
+                backend, bsz_tensor = bsz_tensor, backend
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
@@ -600,8 +603,11 @@ class BatchMLAPagedAttentionWrapper:
         use an ``MLAPlanMetadata`` object instead.
         """
         # The pre-TVM KT wrapper placed bsz_tensor before use_profiler.
-        if isinstance(use_profiler, torch.Tensor) and bsz_tensor is None:
-            bsz_tensor, use_profiler = use_profiler, False
+        if isinstance(use_profiler, torch.Tensor):
+            if bsz_tensor is None:
+                bsz_tensor, use_profiler = use_profiler, False
+            elif isinstance(bsz_tensor, bool):
+                use_profiler, bsz_tensor = bsz_tensor, use_profiler
 
         previous_backend = getattr(self, "_planned_backend", None)
         previous_backend_name = getattr(self, "_planned_backend_name", None)
