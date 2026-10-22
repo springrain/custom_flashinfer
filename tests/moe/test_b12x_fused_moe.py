@@ -32,6 +32,9 @@ Tests include:
 - ReLU2 (non-gated) activation for Nemotron-Super
 """
 
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -61,6 +64,8 @@ def _is_sm12x_supported():
     """Check SM120/SM121 support using repo-standard utility checks."""
     from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
+    if not torch.cuda.is_available():
+        return False
     device = torch.device("cuda")
     return is_sm120a_supported(device) or is_sm121a_supported(device)
 
@@ -253,9 +258,11 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
     _clear_static_cutover_env(monkeypatch)
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     try:
+        # NVFP4's retained static implementation owns a wider band (1024
+        # routed pairs) than MXFP4's generic implementation (640 pairs).
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=80,
+                num_tokens=128,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -263,9 +270,17 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
         )
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=81,
+                num_tokens=129,
                 num_topk=8,
                 activation_precision="fp4",
+            )
+            == "dynamic"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=81,
+                num_topk=8,
+                quant_mode="mxfp4",
             )
             == "dynamic"
         )
@@ -287,6 +302,257 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
         )
     finally:
         moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+
+@cute_dsl_available
+def test_static_workspace_uses_disjoint_route_output_scratch():
+    """Route partials must never alias live packed activations."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.route_output_scratch.shape == (256, 3, 1536)
+    packed_begin = workspace.packed_input.data_ptr()
+    packed_end = packed_begin + workspace.packed_input.nbytes
+    route_begin = workspace.route_output_scratch.data_ptr()
+    route_end = route_begin + workspace.route_output_scratch.nbytes
+    assert max(packed_begin, route_begin) >= min(packed_end, route_end)
+
+
+@cute_dsl_available
+def test_static_workspace_pads_odd_retained_group_geometry():
+    """Five N128 slices are padded to six before retained2 scheduling."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=2,
+        weight_E=2,
+        max_rows=8,
+        k=256,
+        n=640,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.n == 768
+    assert workspace.route_output_scratch.shape == (8, 3, 256)
+
+
+@cute_dsl_available
+def test_dynamic_workspace_keeps_native_n128_geometry():
+    """Static retained-group padding must not leak into dynamic geometry."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_dynamic_workspace(
+        state_E=2,
+        weight_E=2,
+        routed_rows=2048,
+        k=256,
+        n=640,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.n == 640
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_undersized_shared_capacity():
+    """A legacy 640-row workspace cannot serve the widened 1024-row band."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=640,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    with pytest.raises(ValueError, match="capacity is too small"):
+        moe_dispatch._validate_static_workspace_for_launch(
+            workspace,
+            state_E=8,
+            weight_E=8,
+            routed_rows=1024,
+            k=256,
+            n=256,
+            num_topk=8,
+            device=torch.device("cpu"),
+            activation_precision="fp4",
+            quant_mode="nvfp4",
+        )
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_wrong_type_and_geometry():
+    """Injected workspaces must match the selected static ABI exactly."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    with pytest.raises(ValueError, match="must be Sm120StaticMoEWorkspace"):
+        moe_dispatch._validate_static_workspace_for_launch(object(), **validation_args)
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+    with pytest.raises(ValueError, match="workspace n mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(
+            workspace, **{**validation_args, "n": 512}
+        )
+
+    workspace.token_map = workspace.token_map[:, :-1]
+    with pytest.raises(ValueError, match="workspace token_map mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(workspace, **validation_args)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "field",
+    [
+        "barrier_count",
+        "barrier_epoch",
+        "active_expert_count",
+        "weight_expert_ids",
+        "global_to_local_expert",
+        "compact_topk_ids",
+        "virt_route_scratch",
+        "packed_a_view",
+        "packed_a_flat",
+        "scale_flat",
+        "dm_barrier_count",
+        "dm_barrier_epoch",
+        "dm_intermediate",
+        "dm_input_gs",
+        "dm_down_input_scale",
+    ],
+)
+def test_static_workspace_rejects_incomplete_kernel_tensor_contract(field):
+    """Every fixed-shape tensor consumed by a reachable static path is checked."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+    value = getattr(workspace, field)
+    assert isinstance(value, torch.Tensor)
+    setattr(workspace, field, value.reshape(-1)[:-1])
+    with pytest.raises(ValueError, match=rf"workspace {field} mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(workspace, **validation_args)
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_broken_derived_view_aliases():
+    """Shape-compatible replacement views may not point at unrelated storage."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    for field in ("packed_a_view", "packed_a_flat", "scale_flat"):
+        workspace = moe_dispatch.allocate_sm120_static_workspace(
+            state_E=8,
+            weight_E=8,
+            max_rows=256,
+            k=256,
+            n=256,
+            num_topk=8,
+            device=torch.device("cpu"),
+            quant_mode="nvfp4",
+        )
+        setattr(workspace, field, torch.empty_like(getattr(workspace, field)))
+        with pytest.raises(ValueError, match=rf"{field} must alias"):
+            moe_dispatch._validate_static_workspace_for_launch(
+                workspace, **validation_args
+            )
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_static_workspace_accepts_equivalent_cuda_device_forms():
+    """An index-less CUDA allocation matches its resolved current device."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    current_device = torch.cuda.current_device()
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cuda"),
+        quant_mode="nvfp4",
+    )
+    moe_dispatch._validate_static_workspace_for_launch(
+        workspace,
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cuda", current_device),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
 
 
 @cute_dsl_available
@@ -1187,6 +1453,10 @@ class TestB12xFunctional:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        if num_tokens == 128:
+            # Reproduce the route distribution that used to overlap packed-A.
+            tensors["token_selected_experts"][:, 0].fill_(0)
+            tensors["token_selected_experts"][:, 1].fill_(1)
         result = b12x_fused_moe(
             x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
@@ -1226,13 +1496,15 @@ class TestB12xFunctional:
     @pytest.mark.parametrize(
         "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
     )
-    @pytest.mark.parametrize("num_tokens", [8, 128])
-    def test_intermediate_not_128_aligned(self, activation: str, num_tokens: int):
-        """NVFP4 transparently pads non-128-aligned intermediate sizes (e.g.
-        Gemma-4's 704) up to a tile multiple; result matches the unpadded ref."""
+    @pytest.mark.parametrize("intermediate_size", [640, 704])
+    @pytest.mark.parametrize("num_tokens", [8, 128, 2048])
+    def test_intermediate_padding_matches_selected_backend(
+        self, activation: str, intermediate_size: int, num_tokens: int
+    ):
+        """Odd N128 counts stay correct across static and dynamic dispatch."""
         from flashinfer import b12x_fused_moe
 
-        hidden_size, intermediate_size = 512, 704  # 704 = 128 * 5.5
+        hidden_size = 512
         num_experts, top_k = 8, 2
         swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
         tensors = create_moe_tensors(
@@ -3116,6 +3388,651 @@ class TestRelu2Activation:
         torch.cuda.synchronize()
         assert not torch.isnan(output).any(), "NaN after ReLU2 CUDA graph replay"
         assert not (output == 0).all(), "All zeros after ReLU2 CUDA graph replay"
+
+
+def _make_cpu_wrapper(monkeypatch, use_cuda_graph=True, **shared):
+    """Build a B12xMoEWrapper without a GPU: fake CUDA 13, CPU buffers."""
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    return b12x_moe_mod.B12xMoEWrapper(
+        num_experts=8,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=128,
+        use_cuda_graph=use_cuda_graph,
+        max_num_tokens=2048,  # crosses the NVFP4 static/dynamic cutover (1024)
+        device="cpu",
+        **shared,
+    )
+
+
+def test_wrapper_defaults_allocate_own_buffers(monkeypatch):
+    """Without sharing, each wrapper allocates its own workspaces and output."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    second = _make_cpu_wrapper(monkeypatch)
+
+    assert len(allocs) == 4  # static + dynamic per wrapper
+    assert second._static_workspace is not first._static_workspace
+    assert second._dynamic_workspace is not first._dynamic_workspace
+    assert second._moe_output is not first._moe_output
+
+
+def test_wrapper_shared_buffers_are_reused(monkeypatch):
+    """Injected shared buffers are reused instead of fresh allocations."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    assert len(allocs) == 2  # static + dynamic
+
+    # Spy on the output factory: sharing must skip the output allocation too.
+    real_empty = torch.empty
+    output_allocs = []
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *a, **kw: output_allocs.append((a, kw)) or real_empty(*a, **kw),
+    )
+
+    second = _make_cpu_wrapper(
+        monkeypatch,
+        shared_static_workspace=first._static_workspace,
+        shared_dynamic_workspace=first._dynamic_workspace,
+        shared_output=first._moe_output,
+    )
+
+    assert len(allocs) == 2  # nothing new allocated
+    assert not output_allocs
+    assert second._static_workspace is first._static_workspace
+    assert second._dynamic_workspace is first._dynamic_workspace
+    assert second._moe_output is first._moe_output
+
+
+def test_wrapper_shared_output_is_validated(monkeypatch):
+    """Incompatible shared_output buffers are rejected at construction."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    monkeypatch.setattr(
+        moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
+    )
+    bad = torch.zeros((4, 64), dtype=torch.float32)  # too small, wrong dtype
+    with pytest.raises(ValueError, match="shared_output"):
+        _make_cpu_wrapper(monkeypatch, shared_output=bad)
+
+
+def test_wrapper_shared_buffers_require_cuda_graph(monkeypatch):
+    """Shared buffers are rejected when CUDA graph mode is disabled."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    monkeypatch.setattr(
+        moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
+    )
+    output = torch.zeros((2048, 256), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="use_cuda_graph"):
+        _make_cpu_wrapper(monkeypatch, use_cuda_graph=False, shared_output=output)
+
+
+@sm120_required
+@cuda_13_required
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_wrapper_shared_output_rejects_other_gpu():
+    """A shared_output on a different CUDA device is rejected.
+
+    Regression test: the device check must compare the full device, including
+    the index — with index-less ``device="cuda"`` resolved to the current
+    device — instead of only the device type.
+    """
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+
+    other_gpu = torch.zeros((16, 256), dtype=torch.bfloat16, device="cuda:1")
+    with torch.cuda.device(0), pytest.raises(ValueError, match="shared_output"):
+        b12x_moe_mod.B12xMoEWrapper(
+            num_experts=8,
+            top_k=1,
+            hidden_size=256,
+            intermediate_size=128,
+            use_cuda_graph=True,
+            max_num_tokens=16,
+            device="cuda",  # index-less: resolves to cuda:0
+            shared_output=other_gpu,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dense-kernel borrow contract (CPU-only, pure source scan).
+#
+# SM12x MoE kernel classes invoke DenseGemmKernel helpers unbound, e.g.
+# ``self._dense_cls._partition_fragment_SFA(self, ...)`` with ``self`` being
+# the MoE kernel. Every ``self.<attr>`` read inside such a borrowed method
+# (including transitive intra-class calls) must be provided by the borrower.
+# Everything below works on parsed sources only — it imports no kernel
+# module, so it runs even where the CuTe DSL stack is unavailable. Borrowers
+# are discovered by scanning the fused_moe sources for the borrow pattern,
+# so new kernels are covered without editing this test.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FUSED_MOE_DIR = _REPO_ROOT / "flashinfer" / "fused_moe"
+_DENSE_KERNEL_FILE = (
+    _REPO_ROOT
+    / "flashinfer"
+    / "gemm"
+    / "kernels"
+    / "dense_blockscaled_gemm_sm120_b12x.py"
+)
+
+
+def _class_def(path, name):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def _self_deps(class_def, entry):
+    """All ``self.<attr>`` reads reachable from method ``entry``."""
+    methods = {n.name: n for n in class_def.body if isinstance(n, ast.FunctionDef)}
+    deps, seen, stack = set(), set(), [entry]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in methods:
+            continue
+        seen.add(name)
+        for node in ast.walk(methods[name]):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+            ):
+                deps.add(node.attr)
+                stack.append(node.attr)
+    deps.discard(entry)  # the borrowed method itself stays on DenseGemmKernel
+    return deps
+
+
+def _provided(class_def):
+    """Attributes a class offers: its methods and ``self.<attr>`` assignments."""
+    out = set()
+    for node in ast.walk(class_def):
+        if isinstance(node, ast.FunctionDef):
+            out.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            out.update(
+                t.attr
+                for t in targets
+                if isinstance(t, ast.Attribute)
+                and isinstance(t.value, ast.Name)
+                and t.value.id == "self"
+            )
+    return out
+
+
+def _borrowed_method_name(node):
+    """Match ``self._dense_cls.<name>(self, ...)``; return the method name."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_dense_cls"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "self"
+    ):
+        return node.func.attr
+    return None
+
+
+def _dense_cls_target(class_def):
+    """Class referred to by ``_dense_cls``, in any common assignment form."""
+    for node in ast.walk(class_def):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            (isinstance(t, ast.Attribute) and t.attr == "_dense_cls")
+            or (isinstance(t, ast.Name) and t.id == "_dense_cls")
+            for t in targets
+        ):
+            continue
+        if isinstance(node.value, ast.Name):
+            return node.value.id
+        if isinstance(node.value, ast.Attribute):
+            return node.value.attr  # e.g. kernels.DenseGemmKernel
+    return None
+
+
+def _find_borrowers():
+    """All (file, class, borrowed methods, _dense_cls target) in fused_moe."""
+    out = []
+    for path in sorted(_FUSED_MOE_DIR.rglob("*.py")):
+        classes = (
+            n
+            for n in ast.walk(ast.parse(path.read_text()))
+            if isinstance(n, ast.ClassDef)
+        )
+        for cls in classes:
+            borrowed = {
+                name for node in ast.walk(cls) if (name := _borrowed_method_name(node))
+            }
+            if borrowed:
+                out.append((path.name, cls, borrowed, _dense_cls_target(cls)))
+    return out
+
+
+_DENSE_KERNEL_CLASS = _class_def(_DENSE_KERNEL_FILE, "DenseGemmKernel")
+_BORROW_CONTRACT_CASES = _find_borrowers()
+
+
+def test_borrower_discovery_is_non_empty():
+    # An empty discovery would silently skip the parametrized contract test.
+    assert _BORROW_CONTRACT_CASES, (
+        "no `_dense_cls` borrow sites found; if a refactor renamed `_dense_cls` "
+        "or changed the borrow idiom, update discovery here — if the pattern was "
+        "intentionally removed, delete this test section."
+    )
+
+
+@pytest.mark.parametrize(
+    "path_name,cls,borrowed,target",
+    _BORROW_CONTRACT_CASES,
+    ids=[f"{p}:{c.name}" for p, c, _, _ in _BORROW_CONTRACT_CASES],
+)
+def test_borrowed_dense_method_self_deps(path_name, cls, borrowed, target):
+    assert target == "DenseGemmKernel", (
+        f"{cls.name} borrows via _dense_cls={target!r}; if it references a "
+        f"different kernel class, extend this test to resolve it."
+    )
+    provided = _provided(cls)
+    for name in borrowed:
+        missing = _self_deps(_DENSE_KERNEL_CLASS, name) - provided
+        assert not missing, (
+            f"{cls.name} borrows DenseGemmKernel.{name}() but does not provide "
+            f"{sorted(missing)}; make the helper a module-level function or add "
+            f"it to {cls.name}."
+        )
+
+
+# =============================================================================
+# Unrouted (negative) expert ids
+# =============================================================================
+
+
+def _mask_routing(tensors: dict, pattern: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark unrouted slots with expert id -1, keeping a non-zero routing weight.
+
+    The masked slots keep weight 0.5 so a pass proves the kernels skip them by
+    id alone (the references skip ``expert_idx < 0`` regardless of weight); a
+    kernel that routed the slot to a stale or substituted expert and applied
+    the caller's weight would fail.
+
+    ``tail`` masks every slot of the last quarter of the tokens (CUDA-graph
+    padding), ``all`` masks every slot, and ``mixed`` masks alternating slots
+    of every token so the remaining weights no longer sum to one.
+    """
+    ids = tensors["token_selected_experts"].clone()
+    weights = tensors["token_final_scales"].clone()
+    num_tokens, top_k = ids.shape
+    if pattern == "tail":
+        masked = torch.zeros_like(ids, dtype=torch.bool)
+        masked[num_tokens - max(1, num_tokens // 4) :] = True
+    elif pattern == "all":
+        masked = torch.ones_like(ids, dtype=torch.bool)
+    elif pattern == "mixed":
+        assert top_k >= 2
+        token = torch.arange(num_tokens, device=ids.device)[:, None]
+        slot = torch.arange(top_k, device=ids.device)[None, :]
+        masked = (token + slot) % 2 == 0
+    else:
+        raise ValueError(pattern)
+    ids[masked] = -1
+    weights[masked] = 0.5
+    return ids, weights
+
+
+def _assert_unrouted_output(
+    result: torch.Tensor, expected: torch.Tensor, ids: torch.Tensor, label: str
+) -> None:
+    assert torch.isfinite(result).all(), f"{label}: non-finite output"
+    fully_masked = (ids < 0).all(dim=1)
+    if fully_masked.any():
+        masked_rows = result[fully_masked]
+        assert torch.equal(masked_rows, torch.zeros_like(masked_rows)), (
+            f"{label}: fully unrouted tokens must produce exact zeros"
+        )
+    passed, percent_within, atol = check_accuracy(result, expected)
+    assert passed, (
+        f"{label}: {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+    )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestUnroutedPairs:
+    """A negative expert id marks an unrouted slot.
+
+    vLLM writes -1 into the CUDA-graph padding rows of ``topk_ids``; every
+    b12x backend must skip such pairs and emit exact zeros for tokens whose
+    slots are all unrouted.
+    """
+
+    hidden_size = 256
+    intermediate_size = 512
+    num_experts = 64
+
+    def _nvfp4_case(
+        self,
+        num_tokens: int,
+        top_k: int,
+        pattern: str,
+        activation: str = "silu",
+        intermediate_size: int | None = None,
+    ):
+        intermediate_size = intermediate_size or self.intermediate_size
+        create = (
+            create_relu2_moe_tensors if activation == "relu2" else create_moe_tensors
+        )
+        tensors = create(
+            num_tokens=num_tokens,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_experts,
+            top_k=top_k,
+            seed=11 + num_tokens,
+        )
+        ids, weights = _mask_routing(tensors, pattern)
+        reference = (
+            compute_reference_moe_relu2
+            if activation == "relu2"
+            else compute_reference_moe_fp4
+        )
+        weight_names = (
+            ("fc1_weights", "fc2_weights")
+            if activation == "relu2"
+            else ("gemm1_weights", "gemm2_weights")
+        )
+        expected = reference(
+            hidden_states=tensors["x_bf16"].float(),
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            **{
+                weight_names[0]: tensors["w1_weight_bf16"].float(),
+                weight_names[1]: tensors["w2_weight_bf16"].float(),
+            },
+        )
+        return tensors, ids, weights, expected
+
+    def _run(self, tensors, ids, weights, top_k, **kwargs):
+        """Run the masked routing after an unmasked call on the same shape.
+
+        The unmasked call dirties the cached workspace, so a kernel that
+        sums the scratch rows of unrouted slots cannot pass by reading a
+        freshly zeroed allocation.
+        """
+        from flashinfer import b12x_fused_moe
+
+        b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=self.num_experts,
+            top_k=top_k,
+            **kwargs,
+        )
+        return b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            **kwargs,
+        )
+
+    def test_compact_topk_ids_skips_unrouted(self):
+        """The micro pre-pass gives unrouted pairs compact id -1."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.triton_compact import (
+            compact_topk_ids,
+        )
+
+        ids = torch.tensor([5, -1, 3, 5, -1, 7], dtype=torch.int32, device="cuda")
+        compact = torch.empty_like(ids)
+        weight_expert_ids = torch.full_like(ids, -7)
+        active_expert_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        compact_topk_ids(ids, compact, weight_expert_ids, active_expert_count)
+        assert compact.tolist() == [0, -1, 1, 0, -1, 2]
+        assert weight_expert_ids[:3].tolist() == [5, 3, 7]
+        assert active_expert_count.item() == 3
+
+    @pytest.mark.parametrize("pattern", ["tail", "all", "mixed"])
+    @pytest.mark.parametrize(
+        "backend,num_tokens",
+        [("direct_micro", 4), ("micro", 4), ("static", 64), ("dynamic", 256)],
+    )
+    def test_forced_backend(self, monkeypatch, backend: str, num_tokens: int, pattern):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+        top_k = 4
+        tensors, ids, weights, expected = self._nvfp4_case(num_tokens, top_k, pattern)
+        result = self._run(tensors, ids, weights, top_k)
+        _assert_unrouted_output(result, expected, ids, f"{backend}/{pattern}")
+
+    @pytest.mark.parametrize("pattern", ["tail", "all", "mixed"])
+    @pytest.mark.parametrize(
+        "activation,intermediate_size",
+        [("silu", 640), ("relu2", 512)],
+        ids=["silu-n640", "relu2-n512"],
+    )
+    def test_dynamic_generic_kernel(
+        self, monkeypatch, activation: str, intermediate_size: int, pattern: str
+    ):
+        """intermediate_size > 512 or a non-gated activation takes the generic
+        dynamic kernel rather than the branch-paired gated one."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+            _GATED_OPTIMIZED_SF_VEC_SIZE,
+            _GATED_OPTIMIZED_TILE_MN,
+            _can_use_gated_optimized_kernel,
+        )
+
+        top_k = 4
+        assert not _can_use_gated_optimized_kernel(
+            activation=activation,
+            sf_vec_size=_GATED_OPTIMIZED_SF_VEC_SIZE,
+            mma_tiler_mn=_GATED_OPTIMIZED_TILE_MN,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            num_topk=top_k,
+        )
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "dynamic")
+        tensors, ids, weights, expected = self._nvfp4_case(
+            256,
+            top_k,
+            pattern,
+            activation=activation,
+            intermediate_size=intermediate_size,
+        )
+        result = self._run(tensors, ids, weights, top_k, activation=activation)
+        _assert_unrouted_output(
+            result,
+            expected,
+            ids,
+            f"dynamic generic {activation} n={intermediate_size}/{pattern}",
+        )
+
+    @pytest.mark.parametrize("activation", ["silu", "relu2", "relu2_shared_input"])
+    @pytest.mark.parametrize("pattern", ["all", "mixed"])
+    def test_single_token_micro(self, monkeypatch, activation: str, pattern: str):
+        """num_tokens == 1 keeps a dense pair-to-expert layout in the MMA micro
+        kernel, so unrouted pairs are handled inside the kernel."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "micro")
+        top_k = 4
+        base_activation = "relu2" if activation.startswith("relu2") else "silu"
+        tensors, ids, weights, expected = self._nvfp4_case(
+            1, top_k, pattern, activation=base_activation
+        )
+        kwargs = {"activation": base_activation}
+        if activation == "relu2_shared_input":
+            # A scalar FC1 input scale selects the shared-input specialization.
+            kwargs["input_global_scale"] = torch.ones(
+                1, dtype=torch.float32, device="cuda"
+            )
+        result = self._run(tensors, ids, weights, top_k, **kwargs)
+        _assert_unrouted_output(
+            result, expected, ids, f"micro m=1 {activation}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    @pytest.mark.parametrize("num_tokens", [64, 512])
+    def test_mxfp4(self, num_tokens: int, pattern: str):
+        """MXFP4 shares the static and dynamic kernels (block-32 scales)."""
+        hidden_size = intermediate_size = 256
+        top_k = 2
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_experts,
+            top_k=top_k,
+            seed=21 + num_tokens,
+        )
+        ids, weights = _mask_routing(tensors, pattern)
+        result = self._run(tensors, ids, weights, top_k, quant_mode="mxfp4")
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            ids,
+            weights,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+        _assert_unrouted_output(
+            result, expected, ids, f"mxfp4 m={num_tokens}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    @pytest.mark.parametrize("num_tokens", [4, 64])
+    def test_w4a16(self, num_tokens: int, pattern: str):
+        """The W4A16 route packer already drops out-of-range ids."""
+        top_k = 4
+        tensors, ids, weights, _ = self._nvfp4_case(num_tokens, top_k, pattern)
+        expected = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            fc2_input_scale=None,
+        )
+        result = self._run(tensors, ids, weights, top_k, quant_mode="w4a16")
+        _assert_unrouted_output(
+            result, expected, ids, f"w4a16 m={num_tokens}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    def test_wrapper_cuda_graph(self, pattern: str):
+        """B12xMoEWrapper covers static and dynamic workspaces under replay."""
+        from flashinfer import B12xMoEWrapper
+
+        top_k = 4
+        max_num_tokens = 512
+        tensors, ids, weights, _ = self._nvfp4_case(max_num_tokens, top_k, pattern)
+        moe = B12xMoEWrapper(
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=max_num_tokens,
+        )
+        for num_tokens in (4, 64, max_num_tokens):
+            kwargs = {
+                "x": tensors["x_bf16"][:num_tokens],
+                "w1_weight": tensors["w1_weight"],
+                "w1_weight_sf": tensors["w1_weight_sf"],
+                "w1_alpha": tensors["w1_alpha"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "w2_weight": tensors["w2_weight"],
+                "w2_weight_sf": tensors["w2_weight_sf"],
+                "w2_alpha": tensors["w2_alpha"],
+                "token_selected_experts": ids[:num_tokens],
+                "token_final_scales": weights[:num_tokens],
+            }
+            moe.run(**kwargs)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = moe.run(**kwargs)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"][:num_tokens].float(),
+                gemm1_weights=tensors["w1_weight_bf16"].float(),
+                gemm2_weights=tensors["w2_weight_bf16"].float(),
+                token_selected_experts=ids[:num_tokens],
+                token_final_scales=weights[:num_tokens],
+                num_tokens=num_tokens,
+                num_experts=self.num_experts,
+                top_k=top_k,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+            )
+            _assert_unrouted_output(
+                result.clone(),
+                expected,
+                ids[:num_tokens],
+                f"wrapper m={num_tokens}/{pattern}",
+            )
 
 
 if __name__ == "__main__":

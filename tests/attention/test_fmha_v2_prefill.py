@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 import flashinfer
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
 
@@ -133,68 +134,95 @@ def attention_ref_torch(
 
     outputs = []
     lse_outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        seq_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        seq_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (seq_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:seq_len].float() * k_scale
-            v_seq = torch.cat(v_pages, dim=0)[:seq_len].float() * v_scale
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                (
+                    paged_kv_cache[pages, 0].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * k_scale
+            )
+            v_seq = (
+                (
+                    paged_kv_cache[pages, 1].reshape(-1, num_kv_heads, head_dim)[
+                        :seq_len
+                    ]
+                ).float()
+                * v_scale
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float() * k_scale
             v_seq = v_flat[kv_start:kv_end].float() * v_scale
 
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        head_dim_v = v_seq.shape[-1]
+
+        # Masks depend only on positions: build once per sequence, shared by
+        # all heads (the previous per-head loop rebuilt them per head).
+        drop_mask = None
+        if causal or window_left >= 0:
+            q_indices = torch.arange(q_len, device=device).unsqueeze(1)
+            kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+            offset = seq_len - q_len
+            keep = torch.ones(q_len, seq_len, dtype=torch.bool, device=device)
+            if causal:
+                keep &= (q_indices + offset) >= kv_indices
+            if window_left >= 0:
+                keep &= kv_indices >= (q_indices + offset - window_left)
+            drop_mask = ~keep
+
+        # Batch the per-head math by KV-head group: identical formula, but one
+        # [G, q_len, kv_len] matmul per KV head instead of a Python loop over
+        # every query head. Grouped (not all-heads-at-once) to bound the
+        # materialized fp32 score matrix at long sequence lengths.
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim_v, dtype=torch.float32, device=device
         )
         if return_lse:
-            lse_seq = torch.zeros(
+            lse_seq = torch.empty(
                 q_len, num_qo_heads, dtype=torch.float32, device=device
             )
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-
-            q_h = q_seq[:, h, :]
-            k_h = k_seq[:, kv_h, :]
-            v_h = v_seq[:, kv_h, :]
-
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
+        for kv_h in range(num_kv_heads):
+            k_h = k_seq[:, kv_h, :]  # [kv_len, head_dim]
+            v_h = v_seq[:, kv_h, :]  # [kv_len, head_dim_v]
+            # [G, q_len, kv_len]; in-place ops below to bound fp32 temporaries.
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
 
             if logits_soft_cap > 0.0:
-                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+                scores.div_(logits_soft_cap).tanh_().mul_(logits_soft_cap)
 
-            if causal:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                causal_mask = (q_indices + offset) >= kv_indices
-                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if drop_mask is not None:
+                scores.masked_fill_(drop_mask, float("-inf"))
 
-            if window_left >= 0:
-                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
-                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                offset = seq_len - q_len
-                window_mask = kv_indices >= (q_indices + offset - window_left)
-                scores = scores.masked_fill(~window_mask, float("-inf"))
-
+            h_lo = kv_h * G
+            h_hi = h_lo + G
             if return_lse:
-                lse_seq[:, h] = torch.logsumexp(scores, dim=-1)
+                lse_seq[:, h_lo:h_hi] = torch.logsumexp(scores, dim=-1).permute(1, 0)
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            o_seq[:, h_lo:h_hi, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
         if return_lse:
@@ -269,75 +297,83 @@ def chunked_attention_ref_torch(
     q_float = q_flat.float()
 
     outputs = []
+    # Host copies once (one sync each) instead of per-request .item() syncs.
+    seq_lens_cpu = seq_lens.cpu()
+    cum_seq_lens_q_cpu = cum_seq_lens_q.cpu()
+    cum_seq_lens_kv_cpu = cum_seq_lens_kv.cpu()
     for b in range(batch_size):
-        kv_len = seq_lens[b].item()
-        q_start = cum_seq_lens_q[b].item()
-        q_end = cum_seq_lens_q[b + 1].item()
+        kv_len = int(seq_lens_cpu[b])
+        q_start = int(cum_seq_lens_q_cpu[b])
+        q_end = int(cum_seq_lens_q_cpu[b + 1])
         q_len = q_end - q_start
         q_seq = q_float[q_start:q_end]
 
         if is_paged:
             num_pages_needed = (kv_len + page_size - 1) // page_size
-            k_pages = []
-            v_pages = []
-            for p in range(num_pages_needed):
-                page_idx = block_tables[b, p].item()
-                k_pages.append(paged_kv_cache[page_idx, 0])
-                v_pages.append(paged_kv_cache[page_idx, 1])
-            k_seq = torch.cat(k_pages, dim=0)[:kv_len].float()
-            v_seq = torch.cat(v_pages, dim=0)[:kv_len].float()
+            # Single gather instead of one .item() sync + slice per page.
+            pages = block_tables[b, :num_pages_needed].long()
+            k_seq = (
+                paged_kv_cache[pages, 0]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
+            v_seq = (
+                paged_kv_cache[pages, 1]
+                .reshape(-1, num_kv_heads, head_dim)[:kv_len]
+                .float()
+            )
         else:
-            kv_start = cum_seq_lens_kv[b].item()
-            kv_end = cum_seq_lens_kv[b + 1].item()
+            kv_start = int(cum_seq_lens_kv_cpu[b])
+            kv_end = int(cum_seq_lens_kv_cpu[b + 1])
             k_seq = k_flat[kv_start:kv_end].float()
             v_seq = v_flat[kv_start:kv_end].float()
-
-        o_seq = torch.zeros(
-            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
-        )
 
         # Absolute KV-space positions for each query token.
         # Query token i corresponds to KV position (kv_len - q_len + i).
         offset = kv_len - q_len
 
-        for h in range(num_qo_heads):
-            kv_h = h // heads_per_group
-            q_h = q_seq[:, h, :]
+        # Build chunked causal mask once per sequence (shared by all heads).
+        # q_abs[i] = offset + i  (absolute KV-space row for query token i)
+        # kv_pos[j] = j           (KV column index)
+        q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
+        kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+
+        # Causal: col <= row
+        causal_mask = kv_pos <= q_abs
+
+        # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
+        chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
+        chunk_mask = kv_pos >= chunk_start
+
+        drop_mask = ~(causal_mask & chunk_mask)
+
+        # Batch the per-head math by KV-head group (see attention_ref_torch).
+        G = heads_per_group
+        q_grouped = q_seq.permute(1, 0, 2).reshape(num_kv_heads, G, q_len, head_dim)
+        o_seq = torch.empty(
+            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        for kv_h in range(num_kv_heads):
             k_h = k_seq[:, kv_h, :]
             v_h = v_seq[:, kv_h, :]
 
-            # scores: [q_len, kv_len]
-            scores = torch.matmul(q_h, k_h.t()) * sm_scale
-
-            # Build chunked causal mask.
-            # q_abs[i] = offset + i  (absolute KV-space row for query token i)
-            # kv_pos[j] = j           (KV column index)
-            q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
-            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
-
-            # Causal: col <= row
-            causal_mask = kv_pos <= q_abs
-
-            # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
-            chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
-            chunk_mask = kv_pos >= chunk_start
-
-            mask = causal_mask & chunk_mask
-            scores = scores.masked_fill(~mask, float("-inf"))
+            # scores: [G, q_len, kv_len]
+            scores = torch.matmul(q_grouped[kv_h], k_h.t().unsqueeze(0))
+            scores.mul_(sm_scale)
+            scores.masked_fill_(drop_mask, float("-inf"))
 
             attn = torch.softmax(scores, dim=-1)
-            o_seq[:, h, :] = torch.matmul(attn, v_h)
+            h_lo = kv_h * G
+            o_seq[:, h_lo : h_lo + G, :] = torch.matmul(attn, v_h.unsqueeze(0)).permute(
+                1, 0, 2
+            )
 
         outputs.append(o_seq)
 
     return torch.cat(outputs, dim=0)
 
 
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("num_heads", [8])
-@pytest.mark.parametrize("head_dim_qk", [192])
-@pytest.mark.parametrize("head_dim_v", [128])
-@pytest.mark.parametrize("seq_len", [1024, 4096, 8192])
 @pytest.mark.parametrize(
     "qkv_dtype,o_dtype",
     [
@@ -345,6 +381,16 @@ def chunked_attention_ref_torch(
         (torch.float8_e4m3fn, torch.bfloat16),
         (torch.float8_e4m3fn, torch.float16),
     ],
+)
+@parametrize_product(
+    {
+        "batch_size": [8],
+        "num_heads": [8],
+        "head_dim_qk": [192],
+        "head_dim_v": [128],
+        "seq_len": [1024, 4096, 8192],
+    },
+    regular=pairwise_product_cases,
 )
 def test_fmha_v2_prefill_deepseek(
     batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
@@ -570,8 +616,7 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
-    "batch_size,seq_len,num_heads",
-    [(1, 128, 4), (1, 1024, 32), (2, 129, 4)],
+    "batch_size,seq_len,num_heads", [(1, 128, 4), (1, 1024, 32), (2, 129, 4)]
 )
 def test_fmha_v2_prefill_sm120_self_attention(
     causal, head_dim, batch_size, seq_len, num_heads
@@ -641,8 +686,13 @@ def test_fmha_v2_prefill_sm120_self_attention(
 
 
 @pytest.mark.parametrize("device_scale", ["bmm1", "bmm2"])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@parametrize_product(
+    {
+        "causal": [False, True],
+        "head_dim": [64, 128],
+    },
+    regular=pairwise_product_cases,
+)
 def test_fmha_v2_prefill_sm120_optional_device_scales(device_scale, causal, head_dim):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
@@ -771,8 +821,13 @@ def test_fmha_v2_prefill_deepseek_validates_seq_len():
         )
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@parametrize_product(
+    {
+        "causal": [False, True],
+        "head_dim": [64, 128],
+    },
+    regular=pairwise_product_cases,
+)
 def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
@@ -1193,13 +1248,8 @@ def run_trtllm_fmha_v2_prefill_case(
         torch.testing.assert_close(lse_kernel, lse_ref, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [1, 16])
-@pytest.mark.parametrize("max_seq_len", [1024])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize(
-    ("dtype", "o_dtype"),
+    "dtype,o_dtype",
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
@@ -1209,7 +1259,7 @@ def run_trtllm_fmha_v2_prefill_case(
     ],
 )
 @pytest.mark.parametrize(
-    ("input_layout", "page_size", "save_softmax_stats"),
+    "input_layout,page_size,save_softmax_stats",
     [
         ("PACKED_QKV", None, False),
         ("CONTIGUOUS_Q_KV", None, False),
@@ -1221,16 +1271,23 @@ def run_trtllm_fmha_v2_prefill_case(
         ("Q_PAGED_KV_HND", 128, False),
     ],
 )
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
+@parametrize_product(
+    {
+        "batch_size": [1, 16],
+        "max_seq_len": [1024],
+        "num_qo_heads": [4, 32],
+        "num_kv_heads": [4],
+        "head_dim": [128, 256],
+        "causal,window_left,mask_mode": [
+            (True, -1, "CAUSAL"),
+            (True, 127, "SLIDING_WINDOW"),
+            (True, 512, "SLIDING_WINDOW"),
+        ],
+        "logits_soft_cap": [0.0, 30.0],
+        "pos_encoding_mode": [None],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("pos_encoding_mode", [None])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_trtllm_fmha_v2_prefill(
     input_layout: str,
     batch_size: int,
@@ -1268,10 +1325,15 @@ def test_trtllm_fmha_v2_prefill(
     )
 
 
-@pytest.mark.parametrize("input_layout", ["Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"])
-@pytest.mark.parametrize("page_size", [32, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@parametrize_product(
+    {
+        "input_layout": ["Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"],
+        "page_size": [32, 128],
+        "dtype": [torch.float16, torch.bfloat16],
+        "num_kv_heads": [1, 4],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
     input_layout: str,
     page_size: int,
@@ -1377,28 +1439,26 @@ def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_seq_len", [1024])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [2])
 @pytest.mark.parametrize("head_dim", [256, 512])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    ("input_layout", "page_size"),
-    [
-        ("CONTIGUOUS_Q_KV", None),
-        ("Q_PAGED_KV_NHD", 32),
-        ("Q_PAGED_KV_NHD", 128),
-    ],
+    "input_layout,page_size",
+    [("CONTIGUOUS_Q_KV", None), ("Q_PAGED_KV_NHD", 32), ("Q_PAGED_KV_NHD", 128)],
 )
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (False, -1, "PADDING"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 1024, "SLIDING_WINDOW"),
-    ],
+@parametrize_product(
+    {
+        "batch_size": [1, 4],
+        "max_seq_len": [1024],
+        "num_qo_heads": [8],
+        "num_kv_heads": [2],
+        "dtype": [torch.float16, torch.bfloat16],
+        "causal,window_left,mask_mode": [
+            (True, -1, "CAUSAL"),
+            (False, -1, "PADDING"),
+            (True, 127, "SLIDING_WINDOW"),
+            (True, 1024, "SLIDING_WINDOW"),
+        ],
+    },
+    regular=pairwise_product_cases,
 )
 def test_trtllm_fmha_v2_prefill_sm120_large_head_dim(
     input_layout: str,
@@ -1489,32 +1549,25 @@ def test_trtllm_fmha_v2_prefill_sm120_chunked_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_seq_len", [16384])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize(
-    ("dtype", "o_dtype"),
-    [
-        (torch.float16, torch.float16),
-        (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.bfloat16),
-    ],
-)
-@pytest.mark.parametrize(
-    "input_layout", ["CONTIGUOUS_Q_KV", "Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"]
-)
-@pytest.mark.parametrize(
-    (
-        "skip_softmax_threshold_scale_factor",
-        "rtol",
-        "atol",
-    ),
-    [
-        (500.0, 2e-2, 1.2e-1),
-        (10000.0, 2e-2, 2e-1),
-    ],
+@parametrize_product(
+    {
+        "batch_size": [1, 4],
+        "max_seq_len": [16384],
+        "num_qo_heads": [4, 32],
+        "num_kv_heads": [4],
+        "head_dim": [128, 256],
+        "dtype,o_dtype": [
+            (torch.float16, torch.float16),
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float8_e4m3fn, torch.bfloat16),
+        ],
+        "input_layout": ["CONTIGUOUS_Q_KV", "Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"],
+        "skip_softmax_threshold_scale_factor,rtol,atol": [
+            (500.0, 2e-2, 1.2e-1),
+            (10000.0, 2e-2, 2e-1),
+        ],
+    },
+    regular=pairwise_product_cases,
 )
 def test_trtllm_fmha_v2_prefill_skip_softmax(
     input_layout: str,
@@ -1551,21 +1604,23 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     )
 
 
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
+@parametrize_product(
+    {
+        "batch_size": [4, 16],
+        "max_seq_len": [1024, 4096],
+        "num_qo_heads": [4, 32],
+        "num_kv_heads": [4],
+        "head_dim": [128],
+        "dtype": [torch.float16, torch.bfloat16],
+        "causal,window_left,mask_mode": [
+            (True, -1, "CAUSAL"),
+            (True, 127, "SLIDING_WINDOW"),
+            (True, 512, "SLIDING_WINDOW"),
+        ],
+        "pos_encoding_mode": [None],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("pos_encoding_mode", [None])
 def test_trtllm_fmha_v2_prefill_attention_sinks(
     batch_size: int,
     max_seq_len: int,
@@ -1685,21 +1740,22 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    ("input_layout", "page_size"),
-    [
-        ("CONTIGUOUS_Q_KV", None),
-        ("SEPARATE_Q_K_V", None),
-        ("Q_PAGED_KV_NHD", 32),
-    ],
+    "input_layout,page_size",
+    [("CONTIGUOUS_Q_KV", None), ("SEPARATE_Q_K_V", None), ("Q_PAGED_KV_NHD", 32)],
 )
-@pytest.mark.parametrize("chunked_attention_size", [64, 256])
+@parametrize_product(
+    {
+        "batch_size": [1, 4],
+        "max_seq_len": [1024, 4096],
+        "num_qo_heads": [4, 32],
+        "num_kv_heads": [4],
+        "head_dim": [128],
+        "dtype": [torch.float16, torch.bfloat16],
+        "chunked_attention_size": [64, 256],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_fmha_v2_prefill_chunked_attention(
     batch_size: int,
     max_seq_len: int,
@@ -1834,15 +1890,20 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_kv_len", [1024, 4096])
-@pytest.mark.parametrize("max_new_tokens", [64, 256])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [32, 128])
-@pytest.mark.parametrize("chunked_attention_size", [64, 256])
+@parametrize_product(
+    {
+        "batch_size": [1, 4],
+        "max_kv_len": [1024, 4096],
+        "max_new_tokens": [64, 256],
+        "num_qo_heads": [4, 32],
+        "num_kv_heads": [4],
+        "head_dim": [128],
+        "dtype": [torch.float16, torch.bfloat16],
+        "page_size": [32, 128],
+        "chunked_attention_size": [64, 256],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
     batch_size: int,
     max_kv_len: int,

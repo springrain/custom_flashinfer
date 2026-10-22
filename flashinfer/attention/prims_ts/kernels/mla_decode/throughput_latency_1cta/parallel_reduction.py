@@ -27,7 +27,7 @@ from ..helpers.ops import (
     warp_reduce_max_f32,
     warp_reduce_sum_f32,
 )
-from ..helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
+from ..helpers.query import flat_query_row_state, public_query_flat_row
 from ..parallel_reduction_topology import ParallelReductionTopology
 from .config import MlaConfig
 
@@ -223,27 +223,23 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
 
     # One statistics warp per covered row stripes over split slots, then
     # publishes normalized scales for all output threads to reuse.
+    # Keep branch-local names separate from the output phase below so CuTe
+    # DSL 4.8 does not thread undefined values through inactive stats warps.
     if warp_idx < Int32(rows_per_slice):
         stats_row = warp_idx
         stats_element = slice_element_base + stats_row * Int32(cfg.head_dim_per_cta_v)
-        head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
-        (
-            storage_flat_query_row,
-            _,
-            _,
-            _,
-            valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
-            head_idx,
+        stats_head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
+        stats_query_row = flat_query_row_state(
+            stats_head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
             batch_idx=batch_idx,
         )
-        if head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-            row_lse = acc_lse[head_idx, None, q_idx, batch_idx]
+        if stats_head_idx < Int32(cfg.num_heads_q) and stats_query_row[4]:
+            row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
                 cfg.num_ctas_per_seq_kv,
                 GMEM_REDUCTION_WARP_LANES,
@@ -255,10 +251,12 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             )
             lse_max = Float32(-Float32.inf)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
                 lane_lse[lane_slot_i] = (
-                    Float32(row_lse[split_idx])
-                    if split_idx < Int32(cfg.num_ctas_per_seq_kv)
+                    Float32(row_lse[stats_split_idx])
+                    if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv)
                     else Float32(-Float32.inf)
                 )
                 lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
@@ -278,19 +276,21 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                 and head_dim_cta_idx == Int32(0)
                 and stats_element % Int32(cfg.head_dim_per_cta_v) == Int32(0)
             ):
-                output_query_row = public_query_flat_row(
+                stats_output_query_row = public_query_flat_row(
                     cfg,
-                    storage_flat_query_row,
+                    stats_query_row[0],
                     batch_idx,
                     cu_seqlens_q,
                 )
-                (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                (lse.iterator.raw_ptr() + stats_output_query_row).store(global_lse)
 
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
-                if split_idx < Int32(cfg.num_ctas_per_seq_kv):
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
+                if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv):
                     smem_scale[
-                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
                     ] = normalized_lse_weight(lane_lse[lane_slot_i], global_lse)
 
     prims.barrier_cta_sync(
@@ -304,16 +304,10 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     dim_in_cta = flat_element - head_idx * Int32(cfg.head_dim_per_cta_v)
     row_in_slice = (flat_element - slice_element_base) // Int32(cfg.head_dim_per_cta_v)
     dim_idx = head_dim_cta_idx * Int32(cfg.head_dim_per_cta_v) + dim_in_cta
-    (
-        storage_flat_query_row,
-        _,
-        _,
-        _,
-        valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    output_query_row_state = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,
@@ -323,7 +317,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         thread_elem_offset < Int32(elements_per_slice)
         and head_idx < Int32(cfg.num_heads_q)
         and dim_idx < Int32(cfg.head_dim_v)
-        and valid_output_row
+        and output_query_row_state[4]
     )
     if valid_output:
         output_acc = cutlass.Array(
@@ -361,7 +355,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
 
         output_query_row = public_query_flat_row(
             cfg,
-            storage_flat_query_row,
+            output_query_row_state[0],
             batch_idx,
             cu_seqlens_q,
         )
@@ -453,10 +447,10 @@ def _run_parallel_gmem_reduction_shared_stats(
             _,
             _,
             valid_stats_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             stats_head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -478,7 +472,7 @@ def _run_parallel_gmem_reduction_shared_stats(
             lane_lse[lane_slot_i] = neg_inf
         local_lse = neg_inf
         if valid_stats:
-            # Form the row view only after validating the grouped output row.
+            # Form the row view only after validating the flat output row.
             # Invalid/padded rows publish a neutral state without an acc_lse
             # address or load.
             row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
@@ -535,10 +529,10 @@ def _run_parallel_gmem_reduction_shared_stats(
         _,
         _,
         valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,
@@ -649,10 +643,10 @@ def _run_parallel_gmem_reduction_shared_stats(
                 _,
                 _,
                 valid_stats_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 stats_head_idx,
                 q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
