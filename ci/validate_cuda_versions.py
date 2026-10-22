@@ -211,19 +211,20 @@ def _validate_dependency_policy(
 
         versions = {}
         expected_operators = {
-            "provider_build_specifier": ">=",
-            "cuda_extra_specifier": ">=",
-            "ci_image_specifier": "==",
+            "provider_build_specifier": (">=", "=="),
+            "cuda_extra_specifier": (">=", "=="),
+            "ci_image_specifier": ("==",),
         }
-        for field, expected_operator in expected_operators.items():
+        for field, allowed_operators in expected_operators.items():
             specifier = _string(
                 dependency, field, context, DEPENDENCY_SPECIFIER_PATTERN
             )
             match = DEPENDENCY_SPECIFIER_PATTERN.fullmatch(specifier)
             assert match is not None
-            if match.group("operator") != expected_operator:
+            if match.group("operator") not in allowed_operators:
+                expected = " or ".join(repr(op) for op in allowed_operators)
                 raise ConfigError(
-                    f"{context}.{field} must use {expected_operator!r}, "
+                    f"{context}.{field} must use {expected}, "
                     f"got {specifier!r}"
                 )
             versions[field] = match.group("version")

@@ -56,7 +56,7 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 After the editable install, bring the DSL up to a supported version:
 
 ```bash
-pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
+pip install "nvidia-cutlass-dsl[cu13]==4.8.0"
 ```
 
 The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega

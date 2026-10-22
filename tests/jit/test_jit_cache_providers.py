@@ -205,9 +205,9 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
     build_utils = ModuleType("build_utils")
     build_utils.get_git_version = lambda cwd=None: "deadbeef"
     build_utils.get_build_dependency_requirements = lambda cuda_major: [
-        "nvidia-cutlass-dsl[cu13]>=4.6.2a0"
+        "nvidia-cutlass-dsl[cu13]==4.8.0"
         if cuda_major == "13"
-        else "nvidia-cutlass-dsl>=4.6.2a0"
+        else "nvidia-cutlass-dsl==4.8.0"
     ]
 
     monkeypatch.setitem(sys.modules, "package_config", package_config)
@@ -240,7 +240,7 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
             lambda _settings: ["setuptools>=77"],
         )
 
-        expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
+        expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]==4.8.0"]
         assert module.get_requires_for_build_wheel(None) == expected
         assert module.get_requires_for_build_editable(None) == expected
 
