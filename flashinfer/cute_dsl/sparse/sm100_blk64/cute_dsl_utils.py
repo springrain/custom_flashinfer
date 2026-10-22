@@ -28,7 +28,7 @@ from cutlass.cute.runtime import from_dlpack
 _STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
 
-_EXPECTED_CUTLASS_DSL_VERSION = "4.7.0"  # keep in sync with requirements.txt
+_EXPECTED_CUTLASS_DSL_VERSION = "4.7.0"  # last version this shim was validated against
 
 # Serializes the save/patch/restore sequence below so overlapping
 # cute.compile(..., "--enable-tvm-ffi") calls from different threads can't

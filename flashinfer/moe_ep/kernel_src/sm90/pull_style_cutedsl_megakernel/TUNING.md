@@ -479,7 +479,7 @@ every sweep script records it to `clocks.txt` before timing, and no
 row in this document was taken unlocked).  Python 3.12, torch `2.12.0+cu130`,
 `nvshmem4py-cu13`, **`nvidia-cutlass-dsl 4.6.0`** — the measurement
 environment, pinned separately from the repository's supported range
-(`requirements.txt` >= 4.6.2a0, `pyproject.toml` cu13 extra >= 4.7.0a0);
+(`requirements.txt` >= 4.8.0, `pyproject.toml` cu13 extra >= 4.8.0);
 the drop pins `4.5.0dev0`, and 4.6.0 compiles and runs this SM90 tree.  Whether the SM100
 tree's ">=4.6.1 perf floor" finding applies to the SM90 kernels is
 UNTESTED — worth one A/B run.
