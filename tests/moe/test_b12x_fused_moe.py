@@ -220,6 +220,92 @@ def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
     assert tile_n == 64
 
 
+def _ultra_fc2_tile_fits(**overrides):
+    """Qwen3.6-35B-A3B decode FC2 (N=2048, K=512) with the TC-decode ultra tile."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        _candidate_tile_fits,
+    )
+
+    kwargs = dict(
+        problem_n=2048,
+        problem_k=512,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=32,
+        cta_threads=256,
+        max_shared_mem=101_376 - 512,
+        scale_format="e4m3_k16",
+        weight_layout="packed",
+    )
+    kwargs.update(overrides)
+    return _candidate_tile_fits(**kwargs)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_accepts_tc_decode_ultra_fc2_tile():
+    """The selector's tile_k=32 ultra FC2 tile sits below the search floor but
+    must survive the force_tile_config re-pin across the custom-op boundary."""
+    assert not _ultra_fc2_tile_fits()
+    assert _ultra_fc2_tile_fits(enforce_search_floor=False)
+
+
+@cute_dsl_available
+def test_w4a16_forced_tile_validation_keeps_correctness_constraints():
+    """Relaxing the search floor must not admit misaligned or oversized tiles."""
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_k=8)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, tile_n=768)
+    assert not _ultra_fc2_tile_fits(enforce_search_floor=False, max_shared_mem=1024)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+def test_w4a16_tc_decode_ultra_fc2_tile_survives_custom_op_repin():
+    """Regression for the W4A16 decode crash on Qwen3.6-35B-A3B shapes: the
+    auto-selected (tile_k=32, tile_n=512) FC2 tile is re-pinned through
+    force_tile_config by the torch custom op and must compile to the same
+    geometry instead of raising ``force_tile_config fc2 tile ... does not fit``.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        compile_w4a16_fused_moe,
+    )
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    selected_ultra = False
+    for size_m in (1, 2, 4):
+        kwargs = dict(
+            size_m=size_m,
+            hidden_size=2048,
+            intermediate_size=512,
+            num_experts=128,
+            top_k=8,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=16,
+            element_dtype="bf16",
+            sms=props.multi_processor_count,
+            max_shared_mem=props.shared_memory_per_block_optin,
+            weight_layout="packed",
+            scale_format="e4m3_k16",
+            w13_layout="packed",
+            direct_topk_routes=True,
+            tc_decode_fused_sum=True,
+        )
+        auto = compile_w4a16_fused_moe(**kwargs)
+        tiles = (auto.fc1_tile_k, auto.fc1_tile_n, auto.fc2_tile_k, auto.fc2_tile_n)
+        selected_ultra |= tiles[2:] == (32, 512)
+        repinned = compile_w4a16_fused_moe(**kwargs, force_tile_config=tiles)
+        assert (
+            repinned.fc1_tile_k,
+            repinned.fc1_tile_n,
+            repinned.fc2_tile_k,
+            repinned.fc2_tile_n,
+        ) == tiles
+    assert selected_ultra, "shape no longer reaches the TC-decode ultra FC2 tile"
+
+
 @cute_dsl_available
 def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
     """Callers provide quant_mode; dispatch owns the concrete workspace type."""
@@ -454,8 +540,6 @@ def test_static_workspace_rejects_wrong_type_and_geometry():
         "dm_barrier_count",
         "dm_barrier_epoch",
         "dm_intermediate",
-        "dm_input_gs",
-        "dm_down_input_scale",
     ],
 )
 def test_static_workspace_rejects_incomplete_kernel_tensor_contract(field):
@@ -2552,6 +2636,86 @@ class TestMicroKernel:
             f"Direct micro: {percent_within * 100:.2f}% within tolerance "
             f"(atol={atol:.4f}, act={activation}, tokens={num_tokens}, "
             f"top_k={top_k})"
+        )
+
+    @pytest.mark.parametrize("per_expert_scales", [False, True])
+    @pytest.mark.parametrize("num_tokens", [1, 2, 8])
+    def test_direct_micro_matches_static_with_calibrated_input_scales(
+        self, monkeypatch, num_tokens: int, per_expert_scales: bool
+    ):
+        """Direct micro reads the activation global scales like the MMA kernels.
+
+        Calibrated scales (amax / (448 * 6)) are far from 1, so reading them in
+        the wrong form rescales the output. The shared test tensors use unit
+        scales, where every form agrees.
+        """
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        x = tensors["x_bf16"]
+        fp4_range = 448.0 * 6.0
+        fc1_scale = (x.float().abs().amax() / fp4_range).reshape(1)
+        if per_expert_scales:
+            fc1_scale = fc1_scale * torch.linspace(
+                1.0, 2.0, num_experts, device=x.device
+            )
+        # Covers the FC2 activations of these weights with headroom.
+        fc2_scale = torch.tensor([1.0 / fp4_range], device=x.device)
+
+        def run(backend: str) -> torch.Tensor:
+            monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+            return b12x_fused_moe(
+                x=x,
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=fc2_scale,
+                input_global_scale=fc1_scale,
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"] * fc2_scale,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+            ).float()
+
+        direct_micro = run("direct_micro")
+        static = run("static")
+
+        rel_diff = ((direct_micro - static).norm() / static.norm()).item()
+        assert rel_diff < 0.05, (
+            f"direct micro vs static: relative difference {rel_diff:.4f} "
+            f"(tokens={num_tokens}, per_expert_scales={per_expert_scales})"
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=x.float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=1.0 / fc2_scale,
+        )
+        passed, percent_within, atol = check_accuracy(direct_micro, ref_output)
+        assert passed, (
+            f"Direct micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
         )
 
     @pytest.mark.parametrize("num_tokens", [1, 2, 4])

@@ -18,10 +18,12 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import device_support_pdl
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
+from tests.test_helpers.pdl import late_store
 
 
 def normal_distribution(std):
@@ -375,6 +377,29 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+# Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
+# map-reduce kernels; the rest take the fused kernel.
+@pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
+def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if not device_support_pdl(logits.device):
+        pytest.skip("PDL not supported on this device")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    temperature_value = 0.5
+
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    expected = softmax(workspace, logits, temperature, 0.0, False)
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = softmax(workspace, logits, temperature, 0.0, True)
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -1647,3 +1672,78 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("api", ["top_k", "min_p"])
+@pytest.mark.parametrize("remap", ["keep_all", "argmax", "mixed"])
+@pytest.mark.parametrize("expanded", [False, True], ids=["equal_rows", "more_outputs"])
+def test_per_request_param_indexed_by_row(api, remap, expanded):
+    """A per-request threshold must be read from the probs row ``indices`` selects.
+
+    The three rows have different argmax classes and binary-exact probabilities, so
+    the expected answer for each row is an exact set. Each lane's threshold either
+    keeps everything or keeps the argmax alone, and the remapping gives neighbouring
+    lanes different rows, so reading the threshold by output position changes at
+    least one lane's answer in every case here.
+
+    ``equal_rows`` repeats the rows and the thresholds so that the output-indexed
+    read stays in bounds: it is a negative control with a wrong answer rather than a
+    crash. ``more_outputs`` is the shape the fix enables -- fewer probs rows than
+    outputs -- where the output-indexed read would run off the threshold array.
+    """
+    rows = torch.tensor(
+        [
+            [0.5, 0.25, 0.125, 0.125],
+            [0.125, 0.5, 0.25, 0.125],
+            [0.125, 0.125, 0.5, 0.25],
+        ],
+        dtype=torch.float32,
+        device="cuda:0",
+    )
+    num_classes = rows.size(1)
+    lanes = 1024
+    # row 1 keeps every class; rows 0 and 2 keep their argmax only.
+    if api == "top_k":
+        values, dtype = [1, num_classes, 1], torch.int32
+    else:
+        values, dtype = [0.9, 0.01, 0.9], torch.float32
+    threshold = torch.tensor(values, dtype=dtype, device=rows.device)
+    mapping = {"keep_all": [1, 1, 1], "argmax": [2, 0, 2], "mixed": [1, 2, 0]}[remap]
+    indices = torch.tensor(mapping, dtype=torch.int32, device=rows.device).repeat(lanes)
+    if expanded:
+        probs = rows
+    else:
+        probs = rows.repeat(lanes, 1)
+        threshold = threshold.repeat(lanes)
+
+    probs_before = probs.clone()
+    threshold_before = threshold.clone()
+    indices_before = indices.clone()
+    fn = (
+        flashinfer.sampling.top_k_sampling_from_probs
+        if api == "top_k"
+        else flashinfer.sampling.min_p_sampling_from_probs
+    )
+    samples, valid = fn(
+        probs, threshold, indices=indices, seed=20260919, offset=0, return_valid=True
+    )
+
+    assert samples.shape == indices.shape
+    assert samples.dtype == indices.dtype
+    assert valid.shape == indices.shape and valid.dtype == torch.bool
+    assert bool(valid.all())
+    assert bool(((samples >= 0) & (samples < num_classes)).all())
+    assert torch.equal(probs, probs_before)
+    assert torch.equal(threshold, threshold_before)
+    assert torch.equal(indices, indices_before)
+
+    samples = samples.reshape(lanes, len(mapping))
+    for lane, row_idx in enumerate(mapping):
+        counts = torch.bincount(samples[:, lane].long(), minlength=num_classes)
+        if row_idx == 1:
+            # Every class of row 1 has probability >= 1/8, so a lane that keeps all of
+            # them misses one with probability at most 4 * (7/8)**1024 (~1e-59).
+            assert bool((counts > 0).all()), (remap, lane, counts)
+        else:
+            # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
+            assert counts[row_idx].item() == lanes, (remap, lane, counts)

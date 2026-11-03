@@ -29,7 +29,10 @@ from tests.test_helpers.parametrize import (
 )
 from functools import partial
 import flashinfer
+import flashinfer.cudnn.decode as cudnn_decode
+from flashinfer.cudnn.utils import cudnn_frontend_serves_frost_decode
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
@@ -48,13 +51,6 @@ def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
         pytest.skip(
             "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
         )
-
-
-def skip_if_nvfp4_kv_unsupported():
-    # Mirrors the guard in flashinfer.decode/prefill: no NVFP4-KV decode
-    # kernels exist for SM107.
-    if get_compute_capability(torch.device("cuda:0")) == (10, 7):
-        pytest.skip("KV Cache NVFP4 is not supported on SM107")
 
 
 @pytest.fixture(
@@ -798,7 +794,6 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_decode_with_kv_cache per batch item.
     """
-    skip_if_nvfp4_kv_unsupported()
     kv_layout = "NHD"
     torch.manual_seed(42)
 
@@ -1333,7 +1328,7 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
         )
 
 
-def test_tensor_core_decode_rejects_mismatched_q_len():
+def test_tensor_core_decode_rejects_mismatched_q_len(monkeypatch):
     batch_size = 4
     page_size = 16
     num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
@@ -1366,11 +1361,11 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
     with pytest.raises(ValueError, match="q_len_per_req"):
         wrapper.run(q, kv_data)
 
-    cuda_core_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        ws, "NHD", use_tensor_cores=False
-    )
-    with pytest.raises(ValueError, match="use_tensor_cores"):
-        cuda_core_wrapper.plan(
+    def plan_cuda_core_multi_token(**wrapper_kwargs):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=False, **wrapper_kwargs
+        )
+        wrapper.plan(
             indptr,
             indices,
             last_len,
@@ -1382,6 +1377,21 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
             kv_data_type=dtype,
             q_len_per_req=2,
         )
+        return wrapper
+
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token(backend="fa2")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "0")
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token()
+    monkeypatch.delenv(_DECODE_AUTO_CUDNN_ENV)
+    # backend="auto" hands multi-token CUDA-core decode to cuDNN where it can (#5508).
+    cc = get_compute_capability(torch.device("cuda:0"))
+    if cudnn_decode.CUDNN_AVAILABLE and cudnn_frontend_serves_frost_decode(cc):
+        assert plan_cuda_core_multi_token().resolved_backend == "cudnn"
+    else:
+        with pytest.raises(ValueError, match="use_tensor_cores"):
+            plan_cuda_core_multi_token()
 
     fa3_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         ws, "NHD", use_tensor_cores=True, backend="fa3"
